@@ -1,0 +1,168 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Data Repo
+        uses: actions/checkout@v4
+        with:
+          repository: mohamedamine050/project_data_engineering
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Checkout Terraform Repo
+        uses: actions/checkout@v4
+        with:
+          repository: mohamedamine050/terraform-test_spark_fetch-750a4573
+          token: ${{ secrets.GH_TOKEN }}
+          path: terraform
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: terraform/infra
+        run: |
+          terraform init -input=false
+
+      - name: Get Terraform Outputs
+        working-directory: terraform/infra
+        run: |
+          echo "S3_BUCKET_1=$(terraform output -raw scripts_bucket_name)" >> $GITHUB_ENV
+          echo "S3_KEY_1=$(terraform output -raw glue_test_script_s3_uri)" >> $GITHUB_ENV
+          echo "GLUE_JOB_1=$(terraform output -raw glue_job_name)" >> $GITHUB_ENV
+
+
+      - name: Build S3 path
+        run: |
+          echo "S3_PATH_1=$S3_KEY_1" >> $GITHUB_ENV
+
+
+      - name: Build Glue dependencies
+        run: |
+          mkdir -p req
+          pip install -r requirements.txt -t req/ \
+            --no-binary psycopg2-binary
+
+      - name: Zip des libs
+        run: |
+          cd req
+          zip -r ../dependencies.zip .
+
+      - name: Upload dependencies to S3
+        run: |
+          aws s3 cp dependencies.zip s3://tfstate-test-spark-fetch-voajbgvd/dependencies.zip
+
+      - name: Debug S3 path
+        run: |
+          echo "BUCKET=$S3_BUCKET_1"
+          echo "KEY=$S3_KEY_1"
+          echo "FULL=$S3_PATH_1"
+
+
+      - name: Replace Glue script in S3
+        run: |
+          aws s3 cp src/jobs/etl_api_to_csv_products.py $S3_PATH_1
+
+      # ─────────────────────────────
+      # 10. Trigger Glue Jobs + capturer les Run IDs
+      # FIX: on récupère les RUN_ID pour que le smoke test surveille
+      #      ces runs précis, sans relancer les jobs une 2ème fois
+      # ─────────────────────────────
+      - name: Trigger Glue Jobs
+        run: |
+          CONFIG_BUCKET="tfstate-test-spark-fetch-voajbgvd"
+          CONFIG_PATH="s3://${CONFIG_BUCKET}/config.json"
+          DEPS_PATH="s3://${CONFIG_BUCKET}/dependencies.zip"
+
+          RUN1=$(aws glue start-job-run --job-name "$GLUE_JOB_1" --arguments '{"--CONFIG_PATH":"'"$CONFIG_PATH"'","--extra-py-files":"'"$DEPS_PATH"'"}' --query "JobRunId" --output text)
+          echo "RUN_ID_1=$RUN1" >> $GITHUB_ENV
+
+          echo "Jobs lancés : $RUN1"
+
+      # ─────────────────────────────
+      # 11. SMOKE TEST
+      # FIX 1: surveille les runs existants (RUN_ID) → plus de double lancement
+      # FIX 2: polling en parallèle (background) → tous les jobs checkés en même temps
+      # ─────────────────────────────
+      - name: Smoke Test - Validate Glue Jobs
+        run: |
+          set -euo pipefail
+
+          MAX_RETRIES=25
+          SLEEP_TIME=25
+
+          # Surveille un run déjà lancé (RUN_ID passé en argument)
+          # FIX : prend JOB_NAME + RUN_ID existant, ne relance PAS le job
+          watch_run() {
+            local JOB_NAME=$1
+            local RUN_ID=$2
+
+            echo "▶ Watching [$JOB_NAME] run: $RUN_ID"
+
+            local STATUS="STARTING"
+            local COUNT=0
+
+            while [[ "$STATUS" == "STARTING" || "$STATUS" == "RUNNING" ]]; do
+              STATUS=$(aws glue get-job-run \
+                --job-name "$JOB_NAME" \
+                --run-id "$RUN_ID" \
+                --query 'JobRun.JobRunState' \
+                --output text)
+
+              echo "  [$JOB_NAME] → $STATUS"
+
+              COUNT=$((COUNT + 1))
+              if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
+                echo "❌ TIMEOUT: $JOB_NAME ($RUN_ID)"
+                return 1
+              fi
+
+              sleep "$SLEEP_TIME"
+            done
+
+            if [ "$STATUS" != "SUCCEEDED" ]; then
+              echo "❌ FAILED: $JOB_NAME ($RUN_ID) — état final: $STATUS"
+              return 1
+            fi
+
+            echo "✅ PASSED: $JOB_NAME"
+            return 0
+          }
+
+          watch_run "$GLUE_JOB_1" "$RUN_ID_1" &
+
+          # Attendre tous les processus et échouer si l'un d'eux échoue
+          FAILED=0
+          for pid in $(jobs -p); do
+            wait "$pid" || FAILED=1
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "❌ Un ou plusieurs jobs Glue ont échoué."
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ Tous les smoke tests sont passés."
