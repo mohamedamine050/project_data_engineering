@@ -72,7 +72,7 @@ jobs:
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v3
         with:
-          args: -Dsonar.projectKey=mohamedamine050_project_data_engineering -Dsonar.organization=mohamedamine050 -Dsonar.python.coverage.reportPaths=coverage.xml
+          args: -Dsonar.projectKey=mohamedamine050_project_data_engineering -Dsonar.organization=ghaitho20 -Dsonar.python.coverage.reportPaths=coverage.xml
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -89,7 +89,7 @@ jobs:
       - name: Checkout Terraform Repo
         uses: actions/checkout@v4
         with:
-          repository: mohamedamine050/terraform-test_spark_fetch-55966cb3
+          repository: mohamedamine050/terraform-test_spark_fetch-16320feb
           token: ${{ secrets.GH_TOKEN }}
 
       - name: Configure AWS Credentials
